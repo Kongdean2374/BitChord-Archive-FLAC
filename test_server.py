@@ -18,6 +18,8 @@ def response(data=None, audio=False):
 
 class SearchTests(unittest.TestCase):
     def setUp(self):
+        server.SEARCH_CACHE.clear()
+        server.METADATA_CACHE.clear()
         self.client = server.app.test_client()
 
     def run_search(self, query):

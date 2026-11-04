@@ -11,6 +11,8 @@ from test_server import response
 
 class DiagnosticsTests(unittest.TestCase):
     def setUp(self):
+        server.SEARCH_CACHE.clear()
+        server.METADATA_CACHE.clear()
         self.client = server.app.test_client()
 
     def run_case(self, responses, status, kind=None, stage='search', failures=1):
@@ -112,14 +114,14 @@ class DiagnosticsTests(unittest.TestCase):
         self.run_case([search, meta, audio], 504, 'upstream_timeout', 'flac_probe')
         audio.__exit__.assert_called_once()
 
-    def test_partial_results_survive_later_failure(self):
+    def test_verified_result_returns_before_later_failure(self):
         search = response({'response': {'docs': [{'identifier': 'one'}, {'identifier': 'two'}]}})
         meta = response({'metadata': {'licenseurl': 'https://creativecommons.org/licenses/by/4.0/'},
                          'files': [{'name': 'linked jim yosef.flac'}]})
         r, summary, _, _ = self.run_case([search, meta, response()] + [requests.Timeout()] * 2,
-                                        200)
+                                        200, failures=0)
         self.assertEqual(len(r.json['tracks']), 1)
-        self.assertEqual(summary['outcome'], 'partial')
+        self.assertEqual(summary['stop_reason'], 'verified_result')
 
     def test_recovered_retry_is_visible_without_false_terminal_failure(self):
         r, summary, _, _ = self.run_case([requests.Timeout(), response({'response': {'docs': []}})],
