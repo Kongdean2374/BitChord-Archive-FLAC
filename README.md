@@ -94,3 +94,40 @@ API. Therefore this project exposes both a root manifest and `/manifest.json`,
 plus conventional `/search` and `/stream` endpoints. If BitChord's Test button
 reports a schema mismatch, the response shown by Test should be used to adjust
 the manifest fields to the exact build you're running.
+
+## Search correctness and limits
+
+`/search?q=...&quality=lossless&atmos=auto` accepts BitChord preferences and
+unknown extra parameters. This source always offers FLAC; it does not synthesize
+Atmos or transcode quality tiers. Unicode is normalized with NFKC/case folding,
+and punctuation is treated as spacing. Search words are quoted before IA search.
+
+IA full-text item search discovers at most 16 candidates (including indexed track
+lists/descriptions). Each item's file metadata is then searched for the actual
+track title, artist and filename; exact genre/subject queries are also supported.
+IA does not globally index every file tag: tracks absent from its item search
+index may remain undiscoverable. A popular commercial title is not guaranteed to
+have an authorized FLAC on IA.
+
+Only unrestricted items with explicit Creative Commons license URLs (including
+CC0/public-domain mark) are accepted. Hosting on IA alone is not permission.
+License conditions such as attribution, noncommercial use and no derivatives
+still apply. Search results retain the IA item artwork link and direct source URL.
+
+Every returned file is checked with a 42-byte FLAC STREAMINFO read. Sample rate,
+bit depth and duration come from that file; unavailable duration/bitrate stay null.
+Titles come from file tags or filenames, never an unrelated album title. IDs are
+`item::filename`; both stream routes resolve that exact file. Old item-only IDs
+continue selecting a verified authorized FLAC.
+
+Requests use short connect/read timeouts and at most one retry for transient
+failures. Search has a 12-second budget and at most 12 file probes. On Linux's
+main thread (the default synchronous Gunicorn worker), a wall-clock timer also
+interrupts slow-drip responses. Threaded workers retain socket/budget checks but
+cannot use SIGALRM; deploy with the documented default sync worker. No executor
+queues remain to wait for after returning results. Upstream errors use a sanitized
+502 response; legitimate empty matches remain HTTP 200. Logs include normalized
+query, candidate/result counts, elapsed time and failure count, without headers
+or credentials.
+
+Run regression tests with `python -m unittest -v`.
