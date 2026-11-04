@@ -103,8 +103,13 @@ Atmos or transcode quality tiers. Unicode is normalized with NFKC/case folding,
 and punctuation is treated as spacing. Search words are quoted before IA search.
 
 IA full-text item search discovers at most 16 candidates (including indexed track
-lists/descriptions). Each item's file metadata is then searched for the actual
-track title, artist and filename; exact genre/subject queries are also supported.
+lists/descriptions). Indexed title/creator/subject/description rank candidates;
+explicit indexed restrictions, incompatible formats and unsupported licenses are
+rejected before metadata requests. Missing index fields remain eligible. At most
+four distinct items receive metadata resolution. Their file metadata is searched
+for the actual track title, artist and filename; exact genre/subject queries are
+also supported. The first authorized, header-verified match returns immediately;
+`limit` is an upper bound, and this latency-oriented search can return one track.
 IA does not globally index every file tag: tracks absent from its item search
 index may remain undiscoverable. A popular commercial title is not guaranteed to
 have an authorized FLAC on IA.
@@ -114,7 +119,8 @@ CC0/public-domain mark) are accepted. Hosting on IA alone is not permission.
 License conditions such as attribution, noncommercial use and no derivatives
 still apply. Search results retain the IA item artwork link and direct source URL.
 
-Every returned file is checked with a 42-byte FLAC STREAMINFO read. Sample rate,
+Every fresh result is checked with a 42-byte FLAC STREAMINFO read; short-lived
+search-cache hits reuse only previously verified results. Sample rate,
 bit depth and duration come from that file; unavailable duration/bitrate stay null.
 Titles come from file tags or filenames, never an unrelated album title. IDs are
 `item::filename`; both stream routes resolve that exact file. Old item-only IDs
@@ -162,3 +168,54 @@ Error responses retain `tracks` and `error`, adding `errorType` and `stage`.
 Verified tracks found before a later failure are returned with HTTP 200 and a
 `partial` log outcome. Query filters, licensing, retry count and timeout values
 are unchanged by the diagnostics fix.
+
+### Metadata work and bounded caching
+
+No additional concurrency or timeout increases are used. Before starting another
+metadata resolution, at least 5.5 seconds must remain (the existing two bounded
+connect/read attempts plus overhead). Otherwise search stops with the existing
+budget-exhausted classification; failures and budget stops are never cached as
+empty results. A completed scan of the selected subset with no matches returns
+200 and may have `stop_reason=candidate_limit`; it is not a claim that all IA
+files were searched.
+
+Caches are in-process per worker, protected by a lock and bounded with LRU/TTL:
+
+| Cache | Entries | Maximum bytes per entry | TTL |
+| --- | --- | --- | --- |
+| Verified search tracks, normalized query + limit | 64 | 128 KiB | 30 s |
+| Successful empty search | same search cache | same | 10 s |
+| Validated item metadata | 64 | 256 KiB | 60 s |
+
+Errors/partial failure responses are not search-cached. Oversized entries are not
+cached. Metadata cache hits still check restriction/license fields and never
+replace FLAC header validation on a new search. Search-cache hits contain only
+tracks that passed both checks when created. Source access/license changes may
+remain stale for these short TTLs (a result created from cached metadata may
+retain that metadata's prior license observation for up to 90 seconds total).
+Stream resolution retains its existing routes and validates the actual FLAC;
+metadata lookup can use the same bounded cache. Caches do not survive restarts
+and are not shared across Gunicorn workers.
+
+`archive_search` now includes `stage_ms` for initial search, candidate filtering
+(index ranking plus file matching), metadata resolution and FLAC validation.
+These timings include JSON processing and cache lookup; failures are timed too.
+It also records metadata operation count (retries remain separate attempt logs),
+selected/index-rejected candidates, cache hits and a stop reason. A search-cache
+hit has zero upstream work in all four stages.
+
+Local measurements against live IA on 2026-11-04 (not Render deployment tests):
+
+| linked | Total | Initial search | Candidate filtering | Metadata | FLAC validation | Metadata operations |
+| --- | --- | --- | --- | --- | --- | --- |
+| Before, cold | 9.26 s | 1.134 s | not separately instrumented | 8.121 s | 0 | 16 |
+| After, cold | 3.079 s | 1.576 s | 0.016 s | 1.486 s | 0 | 4 |
+| After, repeated search | 0.003 s | 0 | 0 | 0 | 0 | 0 |
+
+All three linked responses were HTTP 200 with zero verified matches. These are
+individual observations with variable IA latency, not a latency guarantee.
+Classical additionally exercised FLAC verification: the first request saw an
+upstream probe HTTP 500 and metadata timeouts, stopping with budget_exhausted at
+8.132 s; retry reused metadata, validated an actual FLAC, and returned one track
+in 1.300 s (499 ms search, 4 ms filtering, 0.1 ms metadata, 795 ms FLAC validation).
+That failed search was not cached as an empty success.
