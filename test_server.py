@@ -7,6 +7,7 @@ import server
 
 def response(data=None, audio=False):
     r = Mock()
+    r.status_code = 200
     r.__enter__ = Mock(return_value=r)
     r.__exit__ = Mock(return_value=False)
     r.json.return_value = data
@@ -54,7 +55,7 @@ class SearchTests(unittest.TestCase):
     def test_timeout(self):
         with patch.object(server.SESSION, 'get', side_effect=requests.Timeout('secret')) as get:
             r = self.client.get('/search?q=song')
-        self.assertEqual(r.status_code, 502)
+        self.assertEqual(r.status_code, 504)
         self.assertEqual(get.call_count, 2)
         self.assertNotIn('secret', r.text)
 
@@ -91,8 +92,8 @@ class SearchTests(unittest.TestCase):
             with self.assertLogs(server.app.logger, level='INFO') as logs:
                 r = self.client.get('/search?q=classical')
         self.assertEqual(r.json['tracks'][0]['title'], 'Sonata')
-        self.assertIn('"returned": 1', logs.output[0])
-        self.assertIn('elapsed_ms', logs.output[0])
+        self.assertIn('"returned": 1', logs.output[-1])
+        self.assertIn('elapsed_ms', logs.output[-1])
 
     def test_deadline_interrupts_slow_upstream(self):
         import time
@@ -100,7 +101,8 @@ class SearchTests(unittest.TestCase):
                 server.SESSION, 'get', side_effect=lambda *a, **kw: time.sleep(.5)):
             start = time.monotonic()
             r = self.client.get('/search?q=slow')
-        self.assertEqual(r.status_code, 502)
+        self.assertEqual(r.status_code, 504)
+        self.assertEqual(r.json["errorType"], "budget_exhausted")
         self.assertLess(time.monotonic() - start, .3)
 
     def test_permanent_error_not_retried(self):

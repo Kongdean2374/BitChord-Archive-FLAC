@@ -10,7 +10,8 @@ from functools import wraps
 from urllib.parse import quote
 
 import requests
-from flask import Flask, jsonify, request
+from urllib3.exceptions import HTTPError as TransportError, ReadTimeoutError
+from flask import Flask, g, has_request_context, jsonify, request
 
 app = Flask(__name__)
 app.logger.setLevel("INFO")
@@ -65,6 +66,60 @@ MAX_ITEMS = 16
 MAX_PROBES = 12
 
 
+class SearchBudgetExceeded(requests.Timeout):
+    pass
+
+
+class PayloadError(ValueError):
+    def __init__(self, kind):
+        self.kind = kind
+        super().__init__(kind)
+
+
+def error_kind(exc):
+    if isinstance(exc, SearchBudgetExceeded):
+        return "budget_exhausted"
+    if isinstance(exc, requests.Timeout):
+        return "upstream_timeout"
+    if isinstance(exc, requests.HTTPError):
+        return "upstream_http"
+    if isinstance(exc, PayloadError):
+        return exc.kind
+    if isinstance(exc, (ValueError, TypeError)):
+        return "upstream_parse"
+    return "upstream_network"
+
+
+def diagnostic_event(stage, started, status=None, exc=None, attempt=None):
+    # Never log exception text, URLs, response bodies, or request headers.
+    event = dict(event="attempt" if attempt is not None else "failure",
+                 stage=stage, elapsed_ms=round((time.monotonic() - started) * 1000),
+                 upstream_status=status, error_type=error_kind(exc) if exc else None,
+                 attempt=attempt)
+    app.logger.info("archive_upstream %s", json.dumps(event))
+
+
+def search_failure(exc):
+    diag = g.search_diagnostics
+    kind = error_kind(exc)
+    failure = dict(error_type=kind, stage=diag["stage"],
+                   upstream_status=diag.get("upstream_status"))
+    diag["failures"].append(failure)
+    diagnostic_event(diag["stage"], diag["stage_started"],
+                     diag.get("upstream_status"), exc)
+    return failure
+
+
+def json_payload(response):
+    data = response.json()
+    if not isinstance(data, dict):
+        raise PayloadError("upstream_schema")
+    if "error" in data or (isinstance(data.get("responseHeader"), dict)
+                           and data["responseHeader"].get("status", 0) != 0):
+        raise PayloadError("upstream_api")
+    return data
+
+
 def request_budget(function):
     """Hard wall-clock cap on Render's default synchronous Gunicorn worker."""
     @wraps(function)
@@ -72,7 +127,7 @@ def request_budget(function):
         if threading.current_thread() is not threading.main_thread():
             return function(*args, **kwargs)
         def expired(signum, frame):
-            raise requests.Timeout("request budget exhausted")
+            raise SearchBudgetExceeded("request budget exhausted")
         previous = signal.signal(signal.SIGALRM, expired)
         timer = signal.setitimer(signal.ITIMER_REAL, SEARCH_SECONDS)
         try:
@@ -85,28 +140,48 @@ def request_budget(function):
 
 def upstream(url, deadline, **kwargs):
     """Two attempts, bounded socket waits and no retry of permanent errors."""
+    stage = "search" if url == IA_SEARCH else "metadata" if url.startswith("https://archive.org/metadata/") else "flac_probe"
+    diag = getattr(g, "search_diagnostics", None) if has_request_context() else None
+    if diag is not None:
+        diag.update(stage=stage, stage_started=time.monotonic(), upstream_status=None)
     for attempt in range(2):
+        started = time.monotonic()
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise requests.Timeout("request budget exhausted")
+            raise SearchBudgetExceeded("request budget exhausted")
         response = None
         try:
             response = SESSION.get(url, timeout=(min(1, remaining / 2),
                                    min(1.5, remaining / 2)), **kwargs)
+            if diag is not None:
+                diag["upstream_status"] = response.status_code
             response.raise_for_status()
+            diagnostic_event(stage, started, response.status_code, attempt=attempt + 1)
             return response
         except requests.RequestException as exc:
+            # requests may wrap the signal timeout as ConnectionError.
+            if time.monotonic() >= deadline:
+                exc = SearchBudgetExceeded()
             if response is not None:
                 response.close()
             status = exc.response.status_code if exc.response is not None else None
-            if attempt or (status is not None and status != 429 and status < 500):
-                raise
+            diagnostic_event(stage, started, status, exc, attempt + 1)
+            if diag is not None:
+                diag["upstream_attempt_failures"] += 1
+                diag["upstream_status"] = status
+            if isinstance(exc, SearchBudgetExceeded) or attempt or (status is not None and status != 429 and status < 500):
+                raise exc
     raise requests.Timeout("upstream unavailable")
 
 
 def flac_info(url, deadline):
     with upstream(url, deadline, headers={"Range": "bytes=0-41"}, stream=True) as response:
-        data = response.raw.read(42)
+        try:
+            data = response.raw.read(42)
+        except ReadTimeoutError as exc:
+            raise requests.Timeout() from exc
+        except TransportError as exc:
+            raise requests.ConnectionError() from exc
     if len(data) != 42 or data[:4] != b"fLaC" or data[4] & 127 != 0:
         return None
     if int.from_bytes(data[5:8], "big") != 34:
@@ -160,11 +235,15 @@ def licensed(metadata):
 
 def metadata_for(identifier, deadline):
     with upstream(IA_METADATA.format(quote(identifier, safe="")), deadline) as response:
-        data = response.json()
-    meta = data.get("metadata", {})
+        data = json_payload(response)
+    meta = data.get("metadata")
+    files = data.get("files")
+    if not isinstance(meta, dict) or not isinstance(files, list) or any(
+            not isinstance(f, dict) or not isinstance(f.get("name"), str) for f in files):
+        raise PayloadError("upstream_schema")
     if data.get("is_dark") or meta.get("access-restricted-item") in (True, "true", "1") or not licensed(meta):
         return {}, []
-    return meta, [f for f in data.get("files", [])
+    return meta, [f for f in files
                   if str(f.get("name", "")).lower().endswith(".flac")
                   and not f.get("private")]
 
@@ -235,7 +314,9 @@ def do_search():
     query = normalized((request.args.get("q") or "")[:300])
     # quality and atmos are preferences; this source offers verified FLAC only.
     tracks, docs = [], []
-    failures = 0
+    diag = dict(stage="search", stage_started=started, upstream_status=None,
+                failures=[], upstream_attempt_failures=0, outcome="empty")
+    g.search_diagnostics = diag
     try:
         limit = min(max(int(request.args.get("limit", "20")), 1), 30)
     except ValueError:
@@ -250,10 +331,20 @@ def do_search():
             "q": f'mediatype:audio AND format:Flac AND licenseurl:* AND ({terms})',
             "fl[]": ["identifier"], "rows": MAX_ITEMS, "output": "json",
         }) as response:
-            docs = response.json().get("response", {}).get("docs", [])
+            payload = json_payload(response)
+            result = payload.get("response")
+            if not isinstance(result, dict) or not isinstance(result.get("docs"), list):
+                raise PayloadError("upstream_schema")
+            docs = result["docs"]
+            if any(not isinstance(doc, dict) or not isinstance(doc.get("identifier"), str)
+                   for doc in docs):
+                raise PayloadError("upstream_schema")
         probes = 0
         for doc in docs[:MAX_ITEMS]:
-            if time.monotonic() >= deadline or probes >= MAX_PROBES:
+            if time.monotonic() >= deadline:
+                raise SearchBudgetExceeded()
+            if probes >= MAX_PROBES:
+                diag["outcome"] = "probe_limit"
                 break
             identifier = str(doc.get("identifier") or "")
             if not identifier:
@@ -272,7 +363,10 @@ def do_search():
                                             subjects + [item.get("genre", "")]}
                     if not genre_match and not all(token in haystack for token in query.split()):
                         continue
-                    if probes >= MAX_PROBES or time.monotonic() >= deadline:
+                    if time.monotonic() >= deadline:
+                        raise SearchBudgetExceeded()
+                    if probes >= MAX_PROBES:
+                        diag["outcome"] = "probe_limit"
                         break
                     probes += 1
                     flac = inspect(identifier, item, deadline)
@@ -282,20 +376,36 @@ def do_search():
                         tracks.append(make_track(track_doc, flac))
                     if len(tracks) >= limit:
                         break
-            except (requests.RequestException, ValueError, TypeError):
-                failures += 1
+            except SearchBudgetExceeded:
+                raise
+            except (requests.RequestException, ValueError, TypeError) as exc:
+                search_failure(exc)
             if len(tracks) >= limit:
                 break
-        if failures and not tracks:
-            return jsonify({"tracks": [], "error": "archive upstream unavailable"}), 502
+        if diag["failures"] and not tracks:
+            failure = diag["failures"][-1]
+            diag["outcome"] = failure["error_type"]
+            status = 504 if failure["error_type"] in ("upstream_timeout", "budget_exhausted") else 502
+            return jsonify({"tracks": [], "error": "archive upstream unavailable",
+                            "errorType": failure["error_type"], "stage": failure["stage"]}), status
+        diag["outcome"] = "partial" if diag["failures"] else "results" if tracks else diag["outcome"]
         return jsonify({"tracks": tracks})
-    except (requests.RequestException, ValueError, TypeError):
-        return jsonify({"tracks": [], "error": "archive upstream unavailable"}), 502
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        failure = search_failure(exc)
+        diag["outcome"] = failure["error_type"]
+        if tracks:
+            diag["outcome"] = "partial"
+            return jsonify({"tracks": tracks})
+        status = 504 if failure["error_type"] in ("upstream_timeout", "budget_exhausted") else 502
+        return jsonify({"tracks": [], "error": "archive upstream unavailable",
+                        "errorType": failure["error_type"], "stage": failure["stage"]}), status
     finally:
         app.logger.info("archive_search %s", json.dumps(dict(
             query=query, candidates=len(docs), returned=len(tracks),
             elapsed_ms=round((time.monotonic() - started) * 1000),
-            upstream_failures=failures), ensure_ascii=False))
+            upstream_failures=len(diag["failures"]),
+            upstream_attempt_failures=diag["upstream_attempt_failures"],
+            outcome=diag["outcome"], failures=diag["failures"]), ensure_ascii=False))
 
 
 
