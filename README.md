@@ -126,8 +126,39 @@ main thread (the default synchronous Gunicorn worker), a wall-clock timer also
 interrupts slow-drip responses. Threaded workers retain socket/budget checks but
 cannot use SIGALRM; deploy with the documented default sync worker. No executor
 queues remain to wait for after returning results. Upstream errors use a sanitized
-502 response; legitimate empty matches remain HTTP 200. Logs include normalized
+502 response for HTTP/network/payload faults and 504 for upstream timeouts or
+exhausted search budgets; legitimate empty matches remain HTTP 200. Logs include normalized
 query, candidate/result counts, elapsed time and failure count, without headers
 or credentials.
 
 Run regression tests with `python -m unittest -v`.
+
+### Diagnosing upstream search failures
+
+`archive_upstream` records the search stage (`search`, `metadata`, `flac_probe`),
+HTTP status (null if no response), elapsed milliseconds, error category and attempt
+number. Attempt records cover transport/HTTP success or failure; operation failure
+records also cover JSON/schema errors and budget exhaustion. Exception messages,
+URLs, response bodies and headers are omitted.
+
+`archive_search.upstream_failures` counts failed operations, including the initial
+IA search. `upstream_attempt_failures` counts failed HTTP attempts, including a
+transient failure recovered by retry. These counters have different units and
+should not be added. `failures` lists terminal operation errors, and `outcome`
+distinguishes empty/results/partial results, probe limits and error categories.
+
+| Condition with no usable tracks | HTTP | errorType |
+| --- | --- | --- |
+| Valid response with no matches | 200 | absent |
+| IA HTTP error | 502 | upstream_http |
+| Connection/transport failure | 502 | upstream_network |
+| Invalid JSON | 502 | upstream_parse |
+| Unexpected payload structure | 502 | upstream_schema |
+| IA error payload, even with HTTP 200 | 502 | upstream_api |
+| Upstream socket timeout | 504 | upstream_timeout |
+| Search wall-clock budget exhausted | 504 | budget_exhausted |
+
+Error responses retain `tracks` and `error`, adding `errorType` and `stage`.
+Verified tracks found before a later failure are returned with HTTP 200 and a
+`partial` log outcome. Query filters, licensing, retry count and timeout values
+are unchanged by the diagnostics fix.
